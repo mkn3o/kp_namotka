@@ -5,6 +5,7 @@
 // ==================== ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ ====================
 let canvas, gl, program;
 let u_mvpMatrix, u_color;
+let cleroConst;
 
 // Геометрия оправки
 let mandrelVertices, mandrelIndices;
@@ -32,11 +33,11 @@ const params = {
   R: 1.5,
   L: 4.0,
   rn: 0.4,
+  cleroConst: 0.4,
   tapeWidth: 0.15,
   speed: 0.5,
-  pause: false,
+  pause: true,
   maxLayers: 5,   // максимальное количество отображаемых слоёв
-  renderMode: 'polygons'
 };
 
 // Анимация
@@ -119,14 +120,14 @@ function buildMandrelGeometry() {
   const zLeftStart = zCylStart - domeH;
   const zRightEnd = zCylEnd + domeH;
 
-  const stepsAng = 60;
-  const stepsCyl = 20;
-  const stepsDome = 15;
+  const stepsAng = 60; // количество шагов по углу
+  const stepsCyl = 20; // количество шагов по цилиндру (в длину)
+  const stepsDome = 15; // количество шагов по днищу оправки
 
   const verts = [];
   const idxs = [];
 
-  function addRing(z, r) {
+  function addRing(z, r) {  // кольцо вершин оправки
     for (let i = 0; i < stepsAng; i++) {
       const angle = (i / stepsAng) * Math.PI * 2;
       verts.push(r * Math.cos(angle), r * Math.sin(angle), z);
@@ -188,9 +189,10 @@ function computeGeodesicPath() {
   const L = params.L;
   const rn = params.rn;
   const domeH = Math.sqrt(R * R - rn * rn);
-  const zStart = -L / 2 - domeH;
-  const zEnd = L / 2 + domeH;
-  const c = rn;
+  const zStart = -L / 2 - domeH; // начальная точка намотки по z, L - длина цилиндра, domeH - 
+                                 // - высота полусферы (учтён вырез)
+  const zEnd = L / 2 + domeH;    // конечная точка
+  const c = params.cleroConst;
   const dz = 0.01;
   const maxSteps = 50000;
 
@@ -218,9 +220,9 @@ function computeGeodesicPath() {
   }
 
   // Цилиндр
-  beta0 = Math.asin(rn / R);
+  beta0 = Math.asin(c / R);
   const dthetadzCyl = Math.tan(beta0) / R;
-  let zCyl = -L / 2;
+  let zCyl = zStart + domeH;
   while (zCyl < L / 2 && steps < maxSteps) {
     const dzPart = Math.min(dz, L / 2 - zCyl);
     theta += dthetadzCyl * dzPart;
@@ -259,7 +261,8 @@ function computeGeodesicPath() {
 }
 
 // ==================== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ====================
-function forwardWorld(i, offset) {
+function forwardWorld(i, offset) {  // функции превращают координаты из координат на поверхности
+                                    // вращения в мировые координаты
   const pt = pathPoints[i];
   const theta = pt.theta + offset;
   return [pt.r * Math.cos(theta), pt.r * Math.sin(theta), pt.z];
@@ -271,7 +274,7 @@ function backwardWorld(i, offset) {
   return [pt.r * Math.cos(theta), pt.r * Math.sin(theta), pt.z];
 }
 
-function normalFromWorld(x, y, z) {
+function normalFromWorld(x, y, z) {  // нормаль к оправке
   const R = params.R;
   const L = params.L;
   if (z <= -L/2) {
@@ -712,6 +715,7 @@ function setupGUI() {
   gui.add(params, 'rn', 0.1, 1.5).name('r полюс.отв.').onChange(rebuildAll);
   gui.add(params, 'tapeWidth', 0.05, 0.5).name('Ширина ленты');
   gui.add(params, 'speed', 0.1, 10.0).name('Скорость (об/с)');
+  gui.add(params, 'cleroConst', 0.1, 3.0).name('Константа клеро');
   gui.add(params, 'pause').name('Пауза');
   gui.add(params, 'maxLayers', 1, 10, 1).name('Макс. слоёв').onChange(() => {
     // Принудительно удалить старые слои при уменьшении лимита
@@ -719,7 +723,6 @@ function setupGUI() {
       completedLayers.shift();
     }
   });
-  gui.add(params, 'renderMode', ['polygons', 'wireframe']).name('Режим');
   gui.add({ view: 'Изометрия' }, 'view', ['Спереди', 'Сзади', 'Слева', 'Справа', 'Сверху', 'Снизу', 'Изометрия']).name('Проекция').onChange(updateView);
   gui.add({ reset: rebuildAll }, 'reset').name('Сброс анимации');
 }
