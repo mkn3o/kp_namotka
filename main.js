@@ -5,7 +5,7 @@
 // ==================== ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ ====================
 let canvas, gl, program;
 let u_mvpMatrix, u_color;
-let cleroConst;
+let cleroConst, u_depthOffset;
 
 // Геометрия оправки
 let mandrelVertices, mandrelIndices;
@@ -13,9 +13,11 @@ let pathPoints = [];
 let totalTheta = 0;
 let beta0 = 0;
 
-// Накопленные точки текущего слоя (локальные координаты оправки)
-let currentLayerPoints = [];
-// Массив завершённых слоёв (каждый элемент – массив точек)
+// Накопленные подслои текущего слоя (каждый подслой – массив точек одного прохода)
+let currentLayerSubLayers = [];
+// Текущий проход
+let currentPassPoints = [];
+// Массив завершённых слоёв (каждый элемент – массив подслоёв)
 let completedLayers = [];
 
 // Буферы
@@ -25,8 +27,8 @@ let leftEdgeVAO, leftEdgeVBO, leftEdgeCount = 0;
 let rightEdgeVAO, rightEdgeVBO, rightEdgeCount = 0;
 let markerVAO, markerCount;
 let lineVAO, lineVBO;
-const MAX_TRACE_POINTS = 400000; // оставлен для совместимости, но не используется для лимита слоёв
-const CLEARANCE = 0.5;
+const MAX_TRACE_POINTS = 400000;
+const CLEARANCE = 0.5; // расстояние от каретки до поверхности оправки
 
 // Параметры
 const params = {
@@ -103,6 +105,7 @@ async function initWebGL() {
   gl.useProgram(program);
   u_mvpMatrix = gl.getUniformLocation(program, 'u_mvpMatrix');
   u_color = gl.getUniformLocation(program, 'u_Color');
+  u_depthOffset = gl.getUniformLocation(program, 'depthOffset');
 
   gl.enable(gl.DEPTH_TEST);
   gl.clearColor(0.95, 0.95, 0.95, 1.0);
@@ -295,13 +298,17 @@ function normalFromWorld(x, y, z) {  // нормаль к оправке
 function getAllPoints() {
   let all = [];
   for (let layer of completedLayers) {
-    all = all.concat(layer);
+    for (let subLayer of layer) {
+      all = all.concat(subLayer);
+    }
   }
-  return all.concat(currentLayerPoints);
+  for (let subLayer of currentLayerSubLayers) {
+    all = all.concat(subLayer);
+  }
+  return all.concat(currentPassPoints);
 }
 
-function updateTapeAndEdges() {
-  const points = getAllPoints();
+function updateTapeAndEdges(points) {
   if (points.length < 2) {
     leftEdgeCount = 0;
     rightEdgeCount = 0;
@@ -471,12 +478,13 @@ function setupLineBuffer() {
   gl.bindVertexArray(null);
 }
 
-// ==================== ПЕРЕСТРОЙКА ====================
+// пересоздаёт оправку, траекторию и сбрасывает все данные о слоях и проходах
 function rebuildAll() {
   buildMandrelGeometry();
   setupMandrelBuffers();
   computeGeodesicPath();
-  currentLayerPoints = [];
+  currentLayerSubLayers = [];
+  currentPassPoints = [];
   completedLayers = [];
   lastCarriageIdx = 0;
   currentDirection = 'forward';
@@ -510,7 +518,7 @@ function updateView(view) {
   cameraTarget = [0, 0, 0];
 }
 
-// ==================== ОТРИСОВКА ====================
+// отрисовка
 function drawScene(now) {
   if (!params.pause) {
     const delta = Math.min((now - lastFrameTime) * 0.001, 0.1);
@@ -536,9 +544,10 @@ function drawScene(now) {
   const mandrelAngle = -omega * animationTime;
   const modelMatrix = glMatrix.mat4.rotateZ(glMatrix.mat4.create(), glMatrix.mat4.create(), mandrelAngle);
 
-  // ---- Оправка ----
+  // отрисовка оправки 
   let mvp = glMatrix.mat4.multiply(glMatrix.mat4.create(), vpMatrix, modelMatrix);
   gl.uniformMatrix4fv(u_mvpMatrix, false, mvp);
+  gl.uniform1f(u_depthOffset, 0.0);
   gl.uniform3f(u_color, 0.75, 0.75, 0.75);
   gl.bindVertexArray(mandrelVAO);
   gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, mandrelIBO);
@@ -551,7 +560,7 @@ function drawScene(now) {
     const cycleIndex = Math.floor(animationTime / cycleTime);
     const isForward = tCycle < T_forward;
 
-    const currentPhaseOffset = cycleIndex * phiL;
+    const currentPhaseOffset = cycleIndex * phiL; // фазовый сдвиг для текущего слоя, увеличивается на phiL при каждом новом слое
     const phaseElapsed = isForward ? tCycle : (tCycle - T_forward);
     const progress = Math.min(phaseElapsed / T_forward, 1.0);
 
@@ -560,10 +569,14 @@ function drawScene(now) {
     const completedLayersCount = Math.floor(currentPhaseOffset / twoPi);
     // Сохраняем слой, если появился новый полный слой
     while (completedLayersCount > lastSavedLayerPhase / twoPi) {
-      // Сохраняем текущий слой как завершённый
-      if (currentLayerPoints.length > 0) {
-        completedLayers.push(currentLayerPoints);
-        currentLayerPoints = [];
+      // Сохраняем текущий проход и слой как завершённый
+      if (currentPassPoints.length > 0) {
+        currentLayerSubLayers.push(currentPassPoints);
+        currentPassPoints = [];
+      }
+      if (currentLayerSubLayers.length > 0) {
+        completedLayers.push(currentLayerSubLayers);
+        currentLayerSubLayers = [];
         // Удаляем старые слои, если превышен лимит
         while (completedLayers.length > params.maxLayers) {
           completedLayers.shift();
@@ -579,13 +592,18 @@ function drawScene(now) {
 
     // Обработка смены направления
     if (currentDirection !== direction) {
-      if (currentLayerPoints.length > 0) {
+      // Сохраняем текущий проход как подслой
+      if (currentPassPoints.length > 0) {
+        currentLayerSubLayers.push(currentPassPoints);
+        currentPassPoints = [];
+      }
+      if (currentPassPoints.length > 0) {  // это условие теперь не нужно, но оставим для совместимости
         const oldGet = currentDirection === 'forward' ? forwardWorld : backwardWorld;
         const endIdx = numPoints - 1;
         const step = lastCarriageIdx < endIdx ? 1 : -1;
         for (let i = lastCarriageIdx + step; (step > 0 ? i <= endIdx : i >= endIdx); i += step) {
           if (i >= 0 && i < numPoints) {
-            currentLayerPoints.push(oldGet(i, activePhaseOffset));
+            currentPassPoints.push(oldGet(i, activePhaseOffset));
           }
         }
       }
@@ -602,45 +620,113 @@ function drawScene(now) {
     }
     currentIdx = Math.min(Math.max(currentIdx, 0), numPoints - 1);
 
-    // Добавление новых точек в текущий слой
+    // Добавление новых точек в текущий проход
     if (currentIdx !== lastCarriageIdx) {
       const step = currentIdx > lastCarriageIdx ? 1 : -1;
       for (let i = lastCarriageIdx + step; (step > 0 ? i <= currentIdx : i >= currentIdx); i += step) {
         if (i >= 0 && i < numPoints) {
-          currentLayerPoints.push(getLocalPoint(i));
+          currentPassPoints.push(getLocalPoint(i));
         }
       }
       lastCarriageIdx = currentIdx;
     }
 
     // Отрисовка ленты
-    const allPoints = getAllPoints();
-    if (allPoints.length >= 2) {
-      updateTapeAndEdges();
-
-      // Красная заливка
+    // Сначала все заливки завершённых слоёв
+    for (let layer of completedLayers) {
+      for (let i = 0; i < layer.length; i++) {
+        let subLayer = layer[i];
+        if (subLayer.length >= 2) {
+          updateTapeAndEdges(subLayer);
+          gl.bindVertexArray(tapeVAO);
+          mvp = glMatrix.mat4.multiply(glMatrix.mat4.create(), vpMatrix, modelMatrix);
+          gl.uniformMatrix4fv(u_mvpMatrix, false, mvp);
+          gl.uniform1f(u_depthOffset, -0.001 * i);
+          gl.uniform3f(u_color, 0.9, 0.2, 0.1);
+          gl.drawArrays(gl.TRIANGLE_STRIP, 0, subLayer.length * 2);
+        }
+      }
+    }
+    // Затем заливки подслоёв текущего слоя
+    for (let i = 0; i < currentLayerSubLayers.length; i++) {
+      let subLayer = currentLayerSubLayers[i];
+      if (subLayer.length >= 2) {
+        updateTapeAndEdges(subLayer);
+        gl.bindVertexArray(tapeVAO);
+        mvp = glMatrix.mat4.multiply(glMatrix.mat4.create(), vpMatrix, modelMatrix);
+        gl.uniformMatrix4fv(u_mvpMatrix, false, mvp);
+        gl.uniform1f(u_depthOffset, -0.001 * i);
+        gl.uniform3f(u_color, 0.9, 0.2, 0.1);
+        gl.drawArrays(gl.TRIANGLE_STRIP, 0, subLayer.length * 2);
+      }
+    }
+    // Затем заливка текущего прохода
+    if (currentPassPoints.length >= 2) {
+      updateTapeAndEdges(currentPassPoints);
       gl.bindVertexArray(tapeVAO);
       mvp = glMatrix.mat4.multiply(glMatrix.mat4.create(), vpMatrix, modelMatrix);
       gl.uniformMatrix4fv(u_mvpMatrix, false, mvp);
+      gl.uniform1f(u_depthOffset, -0.001 * currentLayerSubLayers.length);
       gl.uniform3f(u_color, 0.9, 0.2, 0.1);
-      gl.drawArrays(gl.TRIANGLE_STRIP, 0, allPoints.length * 2);
+      gl.drawArrays(gl.TRIANGLE_STRIP, 0, currentPassPoints.length * 2);
+    }
 
-      // Чёрные кромки
+    // Теперь рисуем все границы после заливок
+    // Границы завершённых слоёв
+    for (let layer of completedLayers) {
+      for (let i = 0; i < layer.length; i++) {
+        let subLayer = layer[i];
+        if (subLayer.length >= 2) {
+          updateTapeAndEdges(subLayer);
+          gl.uniform1f(u_depthOffset, -0.001 * i);
+          if (leftEdgeCount > 0) {
+            gl.bindVertexArray(leftEdgeVAO);
+            gl.uniform3f(u_color, 0.0, 0.0, 0.0);
+            gl.drawArrays(gl.LINE_STRIP, 0, leftEdgeCount);
+          }
+          if (rightEdgeCount > 0) {
+            gl.bindVertexArray(rightEdgeVAO);
+            gl.uniform3f(u_color, 0.0, 0.0, 0.0);
+            gl.drawArrays(gl.LINE_STRIP, 0, rightEdgeCount);
+          }
+        }
+      }
+    }
+    // Границы подслоёв текущего слоя
+    for (let i = 0; i < currentLayerSubLayers.length; i++) {
+      let subLayer = currentLayerSubLayers[i];
+      if (subLayer.length >= 2) {
+        updateTapeAndEdges(subLayer);
+        gl.uniform1f(u_depthOffset, -0.001 * i);
+        if (leftEdgeCount > 0) {
+          gl.bindVertexArray(leftEdgeVAO);
+          gl.uniform3f(u_color, 0.0, 0.0, 0.0);
+          gl.drawArrays(gl.LINE_STRIP, 0, leftEdgeCount);
+        }
+        if (rightEdgeCount > 0) {
+          gl.bindVertexArray(rightEdgeVAO);
+          gl.uniform3f(u_color, 0.0, 0.0, 0.0);
+          gl.drawArrays(gl.LINE_STRIP, 0, rightEdgeCount);
+        }
+      }
+    }
+    // Границы текущего прохода
+    if (currentPassPoints.length >= 2) {
+      updateTapeAndEdges(currentPassPoints);
+      gl.uniform1f(u_depthOffset, -0.001 * currentLayerSubLayers.length);
       if (leftEdgeCount > 0) {
         gl.bindVertexArray(leftEdgeVAO);
-        mvp = glMatrix.mat4.multiply(glMatrix.mat4.create(), vpMatrix, modelMatrix);
-        gl.uniformMatrix4fv(u_mvpMatrix, false, mvp);
         gl.uniform3f(u_color, 0.0, 0.0, 0.0);
         gl.drawArrays(gl.LINE_STRIP, 0, leftEdgeCount);
       }
       if (rightEdgeCount > 0) {
         gl.bindVertexArray(rightEdgeVAO);
-        mvp = glMatrix.mat4.multiply(glMatrix.mat4.create(), vpMatrix, modelMatrix);
-        gl.uniformMatrix4fv(u_mvpMatrix, false, mvp);
         gl.uniform3f(u_color, 0.0, 0.0, 0.0);
         gl.drawArrays(gl.LINE_STRIP, 0, rightEdgeCount);
       }
     }
+
+
 
     // ---- Каретка + линия связи ----
     if (currentIdx >= 0 && currentIdx < numPoints) {
@@ -665,12 +751,14 @@ function drawScene(now) {
       gl.bindVertexArray(lineVAO);
       mvp = glMatrix.mat4.multiply(glMatrix.mat4.create(), vpMatrix, glMatrix.mat4.create());
       gl.uniformMatrix4fv(u_mvpMatrix, false, mvp);
+      gl.uniform1f(u_depthOffset, 0.0);
       gl.uniform3f(u_color, 1.0, 0.5, 0.0);
       gl.drawArrays(gl.LINES, 0, 2);
 
       const markerModel = glMatrix.mat4.translate(glMatrix.mat4.create(), glMatrix.mat4.create(), carriagePos);
       mvp = glMatrix.mat4.multiply(glMatrix.mat4.create(), vpMatrix, markerModel);
       gl.uniformMatrix4fv(u_mvpMatrix, false, mvp);
+      gl.uniform1f(u_depthOffset, 0.0);
       gl.uniform3f(u_color, 0.1, 0.4, 0.9);
       gl.bindVertexArray(markerVAO);
       gl.drawElements(gl.TRIANGLES, markerCount, gl.UNSIGNED_SHORT, 0);
@@ -680,7 +768,7 @@ function drawScene(now) {
   requestAnimationFrame(drawScene);
 }
 
-// ==================== МЫШЬ ====================
+
 function setupMouseControls() {
   canvas.addEventListener('mousedown', (e) => {
     mouseDown = true;
@@ -707,7 +795,7 @@ function setupMouseControls() {
   });
 }
 
-// ==================== GUI ====================
+
 function setupGUI() {
   const gui = new dat.GUI();
   gui.add(params, 'R', 0.5, 3.0).name('Радиус R').onChange(rebuildAll);
@@ -727,7 +815,7 @@ function setupGUI() {
   gui.add({ reset: rebuildAll }, 'reset').name('Сброс анимации');
 }
 
-// ==================== ЗАПУСК ====================
+
 window.onload = async () => {
   if (!(await initWebGL())) return;
   rebuildAll();
