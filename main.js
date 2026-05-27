@@ -5,7 +5,7 @@
 // ==================== ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ ====================
 let canvas, gl, program;
 let u_mvpMatrix, u_color;
-let cleroConst, u_depthOffset;
+let u_depthOffset;
 
 // Геометрия оправки
 let mandrelVertices, mandrelIndices;
@@ -34,12 +34,11 @@ const CLEARANCE = 0.5; // расстояние от каретки до пове
 const params = {
   R: 1.5,
   L: 4.0,
-  rn: 0.4,
-  cleroConst: 0.4,
+  rn: 0.7,
   tapeWidth: 0.15,
   speed: 0.5,
   pause: true,
-  maxLayers: 5,   // максимальное количество отображаемых слоёв
+  maxLayers: 2,   // максимальное количество отображаемых слоёв
 };
 
 // Анимация
@@ -186,8 +185,58 @@ function buildMandrelGeometry() {
   mandrelIndices = new Uint16Array(idxs);
 }
 
+
+function calcBottom(zStart, zEnd, L, R, c, dz) {
+  let z = zStart;
+  while (z < zEnd) {
+      const zc = zEnd;
+      const dzPart = Math.min(dz, -L / 2 - z); 
+      const r2 = R * R - (z - zc) * (z - zc);
+      if (r2 <= 0) break;
+      const r = Math.sqrt(r2);
+      const rp = -(z - zc) / r;
+      const denom = Math.sqrt(1 - c * c / (r * r));
+      if (denom < 1e-6 || isNaN(denom)) {theta += dtheta; pathPoints.push({ theta, z, r });  z += dzPart; continue;}
+      const sqrt1rp2 = Math.sqrt(1 + rp * rp);
+      const dthetadz = (c / (r * r)) * sqrt1rp2 / denom;
+      dtheta = dthetadz * dzPart;
+      theta += dtheta;
+      pathPoints.push({ theta, z, r });
+      z += dzPart;
+  }
+}
+
 // ==================== ГЕОДЕЗИЧЕСКАЯ ТРАЕКТОРИЯ ====================
 function computeGeodesicPath() {
+  function calcBottom(zStart, zEnd, zc) {
+    let z = zStart;
+    while (Math.abs(z - zEnd) > 10e-5) {
+        const dzPart = Math.min(dz, Math.abs(zEnd - z)); 
+        const r2 = R * R - (z - zc) * (z - zc);
+        if (r2 <= 0) break;
+        const r = Math.sqrt(r2);
+        const rp = -(z - zc) / r;
+        const denom = Math.sqrt(1 - c * c / (r * r));
+        if (back) {
+          if (denom < 1e-6 || isNaN(denom)) {z -= dzPart; continue;}
+        }
+        else {
+          if (denom < 1e-6 || isNaN(denom)) {z += dzPart; continue;}
+        }
+        const sqrt1rp2 = Math.sqrt(1 + rp * rp);
+        const dthetadz = (c / (r * r)) * sqrt1rp2 / denom;
+        dtheta = dthetadz * dzPart;
+        theta += dtheta;
+        if (back) {
+          pathPoints.push({ theta, z, r, takt });
+          z -= dzPart;
+        }
+        else {
+          pathPoints.push({ theta, z, r, takt });
+          z += dzPart;
+        }
+    }
+  }
   const R = params.R;
   const L = params.L;
   const rn = params.rn;
@@ -195,64 +244,64 @@ function computeGeodesicPath() {
   const zStart = -L / 2 - domeH; // начальная точка намотки по z, L - длина цилиндра, domeH - 
                                  // - высота полусферы (учтён вырез)
   const zEnd = L / 2 + domeH;    // конечная точка
-  const c = params.cleroConst;
+  const c = params.rn;
   const dz = 0.01;
-  const maxSteps = 50000;
+  let takt = 0;
 
   pathPoints = [];
-  let theta = 0;
+  let theta = 1;
+  let dtheta = 0;
   let z = zStart;
   let steps = 0;
-
-  // Левое днище
-  while (z < -L / 2 && steps < maxSteps) {
-    const zc = -L / 2;
-    const dzPart = Math.min(dz, -L / 2 - z);
-    const r2 = R * R - (z - zc) * (z - zc);
-    if (r2 <= 0) break;
-    const r = Math.sqrt(r2);
-    const rp = -(z - zc) / r;
-    const denom = Math.sqrt(1 - c * c / (r * r));
-    if (denom < 1e-6 || isNaN(denom)) { z += dzPart; steps++; continue; }
-    const sqrt1rp2 = Math.sqrt(1 + rp * rp);
-    const dthetadz = (c / (r * r)) * sqrt1rp2 / denom;
-    theta += dthetadz * dzPart;
-    pathPoints.push({ theta, z, r });
-    z += dzPart;
-    steps++;
-  }
-
-  // Цилиндр
+  let back = false;
   beta0 = Math.asin(c / R);
   const dthetadzCyl = Math.tan(beta0) / R;
-  let zCyl = zStart + domeH;
-  while (zCyl < L / 2 && steps < maxSteps) {
-    const dzPart = Math.min(dz, L / 2 - zCyl);
-    theta += dthetadzCyl * dzPart;
-    pathPoints.push({ theta, z: zCyl, r: R });
-    zCyl += dzPart;
-    steps++;
-  }
+  const deltafstar = 2 * Math.PI;
+  while (theta % (2 * Math.PI) > 10e-3) {
+    // прямой ход
+    back = false;
+    // Левое днище
+    theta += params.tapeWidth / (params.R * Math.cos(beta0));
+    z = zStart;
+    calcBottom(z, -L / 2, -L / 2);
 
-  // Правое днище
-  z = L / 2;
-  while (z < zEnd && steps < maxSteps) {
-    const zc = L / 2;
-    const dzPart = Math.min(dz, zEnd - z);
-    const r2 = R * R - (z - zc) * (z - zc);
-    if (r2 <= 0) break;
-    const r = Math.sqrt(r2);
-    const rp = -(z - zc) / r;
-    const denom = Math.sqrt(1 - c * c / (r * r));
-    if (denom < 1e-6 || isNaN(denom)) { z += dzPart; steps++; continue; }
-    const sqrt1rp2 = Math.sqrt(1 + rp * rp);
-    const dthetadz = (c / (r * r)) * sqrt1rp2 / denom;
-    theta += dthetadz * dzPart;
-    pathPoints.push({ theta, z, r });
-    z += dzPart;
-    steps++;
-  }
+    // Цилиндр
+    z = -L / 2;
+    while (z < L / 2) {
+      const dzPart = Math.min(dz, L / 2 - z);
+      theta += dthetadzCyl * dzPart;
+      pathPoints.push({ theta, z, r: R, takt });
+      z += dzPart;
+    }
 
+    // Правое днище
+    z = L / 2;
+    calcBottom(z, L / 2 + domeH, L / 2);
+    theta += params.tapeWidth / params.rn;
+    // обратный ход
+    takt += 1;
+    back = true;
+
+    // правое днище
+    theta += params.tapeWidth / (params.rn);
+    z = L / 2 + domeH;
+    calcBottom(z, L / 2, L / 2);
+
+    // цилиндр
+    z = L / 2;
+    while (z > -L / 2) {
+      const dzPart = dz;
+      theta += dthetadzCyl * dzPart;
+      pathPoints.push({ theta, z, r: R, takt });
+      z -= dzPart;
+    }
+
+    // левое днище
+    z = -L / 2;
+    calcBottom(z, -L / 2 - domeH, -L / 2);
+    theta += params.tapeWidth / (params.R * Math.cos(beta0));
+    takt += 1;
+  }
   totalTheta = theta;
   numPoints = pathPoints.length;
 
@@ -267,15 +316,10 @@ function computeGeodesicPath() {
 function forwardWorld(i, offset) {  // функции превращают координаты из координат на поверхности
                                     // вращения в мировые координаты
   const pt = pathPoints[i];
-  const theta = pt.theta + offset;
+  const theta = pt.theta;
   return [pt.r * Math.cos(theta), pt.r * Math.sin(theta), pt.z];
 }
 
-function backwardWorld(i, offset) {
-  const pt = pathPoints[numPoints - 1 - i];
-  const theta = -pt.theta + offset;
-  return [pt.r * Math.cos(theta), pt.r * Math.sin(theta), pt.z];
-}
 
 function normalFromWorld(x, y, z) {  // нормаль к оправке
   const R = params.R;
@@ -555,62 +599,50 @@ function drawScene(now) {
 
   if (numPoints > 1 && omega > 0.001) {
     const T_forward = totalTheta / omega;
-    const cycleTime = 2.0 * T_forward;
+    const cycleTime = T_forward;
     const tCycle = animationTime % cycleTime;
     const cycleIndex = Math.floor(animationTime / cycleTime);
     const isForward = tCycle < T_forward;
-
     const currentPhaseOffset = cycleIndex * phiL; // фазовый сдвиг для текущего слоя, увеличивается на phiL при каждом новом слое
     const phaseElapsed = isForward ? tCycle : (tCycle - T_forward);
     const progress = Math.min(phaseElapsed / T_forward, 1.0);
 
-    // Проверка завершения слоя: фазовый сдвиг достиг кратного 2π
-    const twoPi = 2 * Math.PI;
-    const completedLayersCount = Math.floor(currentPhaseOffset / twoPi);
-    // Сохраняем слой, если появился новый полный слой
-    while (completedLayersCount > lastSavedLayerPhase / twoPi) {
-      // Сохраняем текущий проход и слой как завершённый
-      if (currentPassPoints.length > 0) {
-        currentLayerSubLayers.push(currentPassPoints);
-        currentPassPoints = [];
-      }
-      if (currentLayerSubLayers.length > 0) {
-        completedLayers.push(currentLayerSubLayers);
-        currentLayerSubLayers = [];
-        // Удаляем старые слои, если превышен лимит
-        while (completedLayers.length > params.maxLayers) {
-          completedLayers.shift();
-        }
-      }
-      lastSavedLayerPhase += twoPi;
-      layerCount++;
-      document.getElementById('layerInfo').innerText = `Слоёв: ${layerCount}`;
-    }
-
+    // // Проверка завершения слоя: фазовый сдвиг достиг кратного 2π
+    // const twoPi = 2 * Math.PI;
+    // const completedLayersCount = Math.floor(currentPhaseOffset / twoPi);
+    // // Сохраняем слой, если появился новый полный слой
+    // while (completedLayersCount > lastSavedLayerPhase / twoPi) {
+    //   // Сохраняем текущий проход и слой как завершённый
+    //   if (currentPassPoints.length > 0) {
+    //     currentLayerSubLayers.push(currentPassPoints);
+    //     currentPassPoints = [];
+    //   }
+    //   if (currentLayerSubLayers.length > 0) {
+    //     completedLayers.push(currentLayerSubLayers);
+    //     currentLayerSubLayers = [];
+    //     // Удаляем старые слои, если превышен лимит
+    //     while (completedLayers.length > params.maxLayers) {
+    //       completedLayers.shift();
+    //     }
+    //   }
+    //   lastSavedLayerPhase += twoPi;
+    //   layerCount++;
+    //   document.getElementById('layerInfo').innerText = `Слоёв: ${layerCount}`;
+    // }
     const direction = isForward ? 'forward' : 'backward';
-    const getLocalPoint = (idx) => isForward ? forwardWorld(idx, currentPhaseOffset) : backwardWorld(idx, currentPhaseOffset);
+    const getLocalPoint = (idx) => forwardWorld(idx);
 
-    // Обработка смены направления
-    if (currentDirection !== direction) {
-      // Сохраняем текущий проход как подслой
-      if (currentPassPoints.length > 0) {
-        currentLayerSubLayers.push(currentPassPoints);
-        currentPassPoints = [];
-      }
-      if (currentPassPoints.length > 0) {  // это условие теперь не нужно, но оставим для совместимости
-        const oldGet = currentDirection === 'forward' ? forwardWorld : backwardWorld;
-        const endIdx = numPoints - 1;
-        const step = lastCarriageIdx < endIdx ? 1 : -1;
-        for (let i = lastCarriageIdx + step; (step > 0 ? i <= endIdx : i >= endIdx); i += step) {
-          if (i >= 0 && i < numPoints) {
-            currentPassPoints.push(oldGet(i, activePhaseOffset));
-          }
-        }
-      }
-      currentDirection = direction;
-      activePhaseOffset = currentPhaseOffset;
-      lastCarriageIdx = 0;
-    }
+    // // Обработка смены направления
+    // if (currentDirection !== direction) {
+    //   // Сохраняем текущий проход как подслой
+    //   if (currentPassPoints.length > 0) {
+    //     currentLayerSubLayers.push(currentPassPoints);
+    //     currentPassPoints = [];
+    //   }
+    //   currentDirection = direction;
+    //   activePhaseOffset = currentPhaseOffset;
+    //   lastCarriageIdx = 0;
+    // }
 
     let currentIdx;
     if (isForward) {
@@ -633,33 +665,33 @@ function drawScene(now) {
 
     // Отрисовка ленты
     // Сначала все заливки завершённых слоёв
-    for (let layer of completedLayers) {
-      for (let i = 0; i < layer.length; i++) {
-        let subLayer = layer[i];
-        if (subLayer.length >= 2) {
-          updateTapeAndEdges(subLayer);
-          gl.bindVertexArray(tapeVAO);
-          mvp = glMatrix.mat4.multiply(glMatrix.mat4.create(), vpMatrix, modelMatrix);
-          gl.uniformMatrix4fv(u_mvpMatrix, false, mvp);
-          gl.uniform1f(u_depthOffset, -0.001 * i);
-          gl.uniform3f(u_color, 0.9, 0.2, 0.1);
-          gl.drawArrays(gl.TRIANGLE_STRIP, 0, subLayer.length * 2);
-        }
-      }
-    }
-    // Затем заливки подслоёв текущего слоя
-    for (let i = 0; i < currentLayerSubLayers.length; i++) {
-      let subLayer = currentLayerSubLayers[i];
-      if (subLayer.length >= 2) {
-        updateTapeAndEdges(subLayer);
-        gl.bindVertexArray(tapeVAO);
-        mvp = glMatrix.mat4.multiply(glMatrix.mat4.create(), vpMatrix, modelMatrix);
-        gl.uniformMatrix4fv(u_mvpMatrix, false, mvp);
-        gl.uniform1f(u_depthOffset, -0.001 * i);
-        gl.uniform3f(u_color, 0.9, 0.2, 0.1);
-        gl.drawArrays(gl.TRIANGLE_STRIP, 0, subLayer.length * 2);
-      }
-    }
+    // for (let layer of completedLayers) {
+    //   for (let i = 0; i < layer.length; i++) {
+    //     let subLayer = layer[i];
+    //     if (subLayer.length >= 2) {
+    //       updateTapeAndEdges(subLayer);
+    //       gl.bindVertexArray(tapeVAO);
+    //       mvp = glMatrix.mat4.multiply(glMatrix.mat4.create(), vpMatrix, modelMatrix);
+    //       gl.uniformMatrix4fv(u_mvpMatrix, false, mvp);
+    //       gl.uniform1f(u_depthOffset, -0.001 * i);
+    //       gl.uniform3f(u_color, 0.9, 0.2, 0.1);
+    //       gl.drawArrays(gl.TRIANGLE_STRIP, 0, subLayer.length * 2);
+    //     }
+    //   }
+    // }
+    // // Затем заливки подслоёв текущего слоя
+    // for (let i = 0; i < currentLayerSubLayers.length; i++) {
+    //   let subLayer = currentLayerSubLayers[i];
+    //   if (subLayer.length >= 2) {
+    //     updateTapeAndEdges(subLayer);
+    //     gl.bindVertexArray(tapeVAO);
+    //     mvp = glMatrix.mat4.multiply(glMatrix.mat4.create(), vpMatrix, modelMatrix);
+    //     gl.uniformMatrix4fv(u_mvpMatrix, false, mvp);
+    //     gl.uniform1f(u_depthOffset, -0.001 * i);
+    //     gl.uniform3f(u_color, 0.9, 0.2, 0.1);
+    //     gl.drawArrays(gl.TRIANGLE_STRIP, 0, subLayer.length * 2);
+    //   }
+    // }
     // Затем заливка текущего прохода
     if (currentPassPoints.length >= 2) {
       updateTapeAndEdges(currentPassPoints);
@@ -672,44 +704,44 @@ function drawScene(now) {
     }
 
     // Теперь рисуем все границы после заливок
-    // Границы завершённых слоёв
-    for (let layer of completedLayers) {
-      for (let i = 0; i < layer.length; i++) {
-        let subLayer = layer[i];
-        if (subLayer.length >= 2) {
-          updateTapeAndEdges(subLayer);
-          gl.uniform1f(u_depthOffset, -0.001 * i);
-          if (leftEdgeCount > 0) {
-            gl.bindVertexArray(leftEdgeVAO);
-            gl.uniform3f(u_color, 0.0, 0.0, 0.0);
-            gl.drawArrays(gl.LINE_STRIP, 0, leftEdgeCount);
-          }
-          if (rightEdgeCount > 0) {
-            gl.bindVertexArray(rightEdgeVAO);
-            gl.uniform3f(u_color, 0.0, 0.0, 0.0);
-            gl.drawArrays(gl.LINE_STRIP, 0, rightEdgeCount);
-          }
-        }
-      }
-    }
-    // Границы подслоёв текущего слоя
-    for (let i = 0; i < currentLayerSubLayers.length; i++) {
-      let subLayer = currentLayerSubLayers[i];
-      if (subLayer.length >= 2) {
-        updateTapeAndEdges(subLayer);
-        gl.uniform1f(u_depthOffset, -0.001 * i);
-        if (leftEdgeCount > 0) {
-          gl.bindVertexArray(leftEdgeVAO);
-          gl.uniform3f(u_color, 0.0, 0.0, 0.0);
-          gl.drawArrays(gl.LINE_STRIP, 0, leftEdgeCount);
-        }
-        if (rightEdgeCount > 0) {
-          gl.bindVertexArray(rightEdgeVAO);
-          gl.uniform3f(u_color, 0.0, 0.0, 0.0);
-          gl.drawArrays(gl.LINE_STRIP, 0, rightEdgeCount);
-        }
-      }
-    }
+    // // Границы завершённых слоёв
+    // for (let layer of completedLayers) {
+    //   for (let i = 0; i < layer.length; i++) {
+    //     let subLayer = layer[i];
+    //     if (subLayer.length >= 2) {
+    //       updateTapeAndEdges(subLayer);
+    //       gl.uniform1f(u_depthOffset, -0.001 * i);
+    //       if (leftEdgeCount > 0) {
+    //         gl.bindVertexArray(leftEdgeVAO);
+    //         gl.uniform3f(u_color, 0.0, 0.0, 0.0);
+    //         gl.drawArrays(gl.LINE_STRIP, 0, leftEdgeCount);
+    //       }
+    //       if (rightEdgeCount > 0) {
+    //         gl.bindVertexArray(rightEdgeVAO);
+    //         gl.uniform3f(u_color, 0.0, 0.0, 0.0);
+    //         gl.drawArrays(gl.LINE_STRIP, 0, rightEdgeCount);
+    //       }
+    //     }
+    //   }
+    // }
+    // // Границы подслоёв текущего слоя
+    // for (let i = 0; i < currentLayerSubLayers.length; i++) {
+    //   let subLayer = currentLayerSubLayers[i];
+    //   if (subLayer.length >= 2) {
+    //     updateTapeAndEdges(subLayer);
+    //     gl.uniform1f(u_depthOffset, -0.001 * i);
+    //     if (leftEdgeCount > 0) {
+    //       gl.bindVertexArray(leftEdgeVAO);
+    //       gl.uniform3f(u_color, 0.0, 0.0, 0.0);
+    //       gl.drawArrays(gl.LINE_STRIP, 0, leftEdgeCount);
+    //     }
+    //     if (rightEdgeCount > 0) {
+    //       gl.bindVertexArray(rightEdgeVAO);
+    //       gl.uniform3f(u_color, 0.0, 0.0, 0.0);
+    //       gl.drawArrays(gl.LINE_STRIP, 0, rightEdgeCount);
+    //     }
+    //   }
+    // }
     // Границы текущего прохода
     if (currentPassPoints.length >= 2) {
       updateTapeAndEdges(currentPassPoints);
@@ -801,9 +833,8 @@ function setupGUI() {
   gui.add(params, 'R', 0.5, 3.0).name('Радиус R').onChange(rebuildAll);
   gui.add(params, 'L', 1.0, 8.0).name('Длина L').onChange(rebuildAll);
   gui.add(params, 'rn', 0.1, 1.5).name('r полюс.отв.').onChange(rebuildAll);
-  gui.add(params, 'tapeWidth', 0.05, 0.5).name('Ширина ленты');
-  gui.add(params, 'speed', 0.1, 10.0).name('Скорость (об/с)');
-  gui.add(params, 'cleroConst', 0.1, 3.0).name('Константа клеро');
+  gui.add(params, 'tapeWidth', 0.05, 0.5).name('Ширина ленты').onChange(rebuildAll);
+  gui.add(params, 'speed', 0.1, 5.0).name('Скорость (об/с)').onChange(rebuildAll);
   gui.add(params, 'pause').name('Пауза');
   gui.add(params, 'maxLayers', 1, 10, 1).name('Макс. слоёв').onChange(() => {
     // Принудительно удалить старые слои при уменьшении лимита
